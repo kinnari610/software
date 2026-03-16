@@ -580,7 +580,7 @@ def generate_pdf():
         elements.append(Paragraph("1) Motor Painting &amp; casting finish found accepted", styles['Normal']))
         elements.append(Paragraph("2) Direction of Rotation found clockwise for R.Y. B .", styles['Normal']))
         elements.append(Paragraph("3) 'V' ring Provided.", styles['Normal']))
-        elements.append(Paragraph("4) Vibration Velocity in mm/sec 0.4 ( With Half Key )", styles['Normal']))
+        elements.append(Paragraph("4) Vibration Velocity found <= 0.9 mm/sec( With Half Key ) in suspended condition.", styles['Normal']))
         elements.append(Spacer(1, 0.05*inch))
         
         # Dimensions table - use manual entries
