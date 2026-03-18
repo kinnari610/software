@@ -802,6 +802,7 @@ def generate_pdf(output_path=None, open_pdf=True):
         elements.append(Spacer(1, 0.01*inch))
         
         # ===== VISUAL INSPECTION =====
+<<<<<<< HEAD
         elements.append(Paragraph("<u><b>Visual Inspection</b></u>", inspection_heading_style))
         elements.append(Paragraph(
             "1) Motor Paint found accepted<br/>"
@@ -814,6 +815,35 @@ def generate_pdf(output_path=None, open_pdf=True):
             inspection_body_style
         ))
         elements.append(Spacer(1, 0.08*inch))
+=======
+        elements.append(Paragraph("<u><b>Visual Inspection</b></u>", styles['Heading3']))
+        elements.append(Paragraph("1) Motor Painting &amp; casting finish found accepted", styles['Normal']))
+        elements.append(Paragraph("2) Direction of Rotation found clockwise for R.Y. B .", styles['Normal']))
+        elements.append(Paragraph("3) 'V' ring Provided.", styles['Normal']))
+        elements.append(Paragraph("4) Vibration Velocity found <= 0.9 mm/sec( With Half Key ) in suspended condition.", styles['Normal']))
+        elements.append(Spacer(1, 0.05*inch))
+        
+        # Dimensions table - use manual entries
+        dim_table = [
+            ["Dimension", "Shaft Diameter", "A - Distance", "B - Distance", "Mounting hole diameter\n at foot", "Total Length", "Pcd", "Mounting hole Diameter \nat flange"],
+            ["Tolerance", "+0.010 / -0.00", "+0.1 / -0.1", "+0.1 / -0.1", "+0.1 / -0.1", "+3.0 / -3.0", "+0.5 / -0.5" , "+0.05 / -0.00"],
+            ["Actual dimension", shaft_dia_var.get(), a_dist_var.get(), b_dist_var.get(), mount_hole_var.get(), total_length_var.get(), pcd_var.get() , flange_var.get()], 
+            ["Results", "Accepted", "Accepted", "Accepted", "Accepted", "Accepted", "Accepted" , "Accepted"]
+        ]
+        t_dim = Table(dim_table, colWidths=[0.9*inch, 0.9*inch, 0.8*inch, 0.8*inch, 1.5*inch, 0.8*inch, 0.6*inch , 1.5*inch])     
+        t_dim.setStyle([('GRID', (0,0), (-1,-1), 0.5, colors.black),
+                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+                        ('ALIGN',(0,0),(-1,-1),'CENTER'),
+                        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+                        ('FONTSIZE',(0,0),(-1,-1),8)])
+        elements.append(t_dim)
+        elements.append(Paragraph("Note : All dimensions are in mm.", styles['Normal']))
+        elements.append(Spacer(1, 0.1*inch))
+        
+        # ===== DIELECTRIC TEST =====
+        # ===== DIELECTRIC TEST =====
+        elements.append(Spacer(1,0.05*inch))
+>>>>>>> 2027a469b8d87a48931d90e21b1adacc2f3d61a2
 
         elements.append(Paragraph("<u><b>0.5 Kw/ 4Pole - Low Speed Test Results of Duel Speed motor</b></u>", styles['Heading4']))
         # Resistance Test table (like screenshot)
