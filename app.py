@@ -10,10 +10,11 @@ import sys
 # ===== FILE PATHS =====
 param_file = r"C:\Users\kinnari\Downloads\Telegram Desktop\TEST_PARAMETER.xlsx"
 data_file = r"C:\Users\kinnari\Downloads\Telegram Desktop\test_data.xlsx"
-# workbook containing the vibration tables; used for page‑2 output
-vibration_file = r"C:\Users\kinnari\Downloads\Telegram Desktop\TELEMA MOTOR VIBRATION TEST REPORT 10-53HZ.xlsx"
+# External workbook providing No-Load test values keyed by Assembly Number
+no_load_file = r"C:\Users\kinnari\Downloads\Book1.xlsx"
 
 # ===== LOAD SHEETS =====
+
 # These will be loaded on demand in load_data()
 
 # ===== FUNCTIONS =====
@@ -91,6 +92,110 @@ def _normalize_assembly_id(val):
         return m.group(1)
 
     return s
+
+
+def _extract_no_load_table(assembly_no: str):
+    """Extract the no-load test table for the given assembly from the no-load workbook.
+
+    The workbook is expected to contain a section like this (one of many assembly blocks):
+
+        assembly no: 2604810-H
+        %Voltage  Volts  AMP  WATT  Current Ratio  Value of Type Tested motor  Remark
+        110       ...
+        100       ...
+        90        ...
+
+    This function searches all sheets in the workbook and returns the first matching
+    table as a list-of-lists (rows), or None if no matching block is found.
+    """
+    try:
+        sheets = pd.read_excel(no_load_file, sheet_name=None, header=None)
+    except Exception as e:
+        print("Warning: failed to load no-load test file:", e)
+        return None
+
+    asm_norm = _normalize_assembly_id(assembly_no)
+    if not asm_norm:
+        return None
+
+    def _find_in_df(df):
+        # Locate the row containing the assembly number (and ideally the label 'assembly no').
+        asm_row = None
+        for idx, row in df.iterrows():
+            joined = " ".join(str(x) if not pd.isna(x) else "" for x in row)
+            if re.search(r"assembly\s*no", joined, flags=re.I) and asm_norm in joined:
+                asm_row = idx
+                break
+            # fallback: match just the assembly id itself if it's in any cell
+            if any(_normalize_assembly_id(x) == asm_norm for x in row):
+                asm_row = idx
+                break
+
+        if asm_row is None:
+            return None
+
+        # Find the header row (contains %Voltage or Volts/AMP/WATT)
+        header_row = None
+        for i in range(asm_row + 1, min(len(df), asm_row + 10)):
+            joined = " ".join(str(x).strip() for x in df.iloc[i].tolist() if not pd.isna(x))
+            if "%Voltage" in joined or ("Volts" in joined and "AMP" in joined) or "WATT" in joined:
+                header_row = i
+                break
+
+        if header_row is None:
+            header_row = asm_row + 1
+
+        # Collect rows from header_row until blank row or next assembly marker.
+        rows = []
+        for i in range(header_row, len(df)):
+            row = df.iloc[i].tolist()
+            # stop when completely blank row (no non-empty cells)
+            if all(pd.isna(x) or str(x).strip() == "" for x in row):
+                break
+
+            joined = " ".join(str(x) if not pd.isna(x) else "" for x in row)
+            # stop if we hit another assembly section or new test section
+            if re.search(r"assembly\s*no", joined, flags=re.I) or re.search(r"locked\s+rotor", joined, flags=re.I):
+                break
+
+            rows.append(["" if pd.isna(x) else str(x).strip() for x in row])
+
+        return rows or None
+
+    # Try every sheet until we find a matching block.
+    for sheet_name, df in sheets.items():
+        table = _find_in_df(df)
+        if table:
+            return table
+
+    return None
+
+
+def _get_no_load_test_values(assembly_no: str):
+    """Return the first row of no-load test values for the given assembly.
+
+    This is used for the small UI display (no_load_var).
+    """
+    tbl = _extract_no_load_table(assembly_no)
+    if not tbl or len(tbl) < 2:
+        return None
+
+    # Take the first data row after the header row.
+    # Attempt to map columns based on the expected format.
+    header = [c.strip().upper() for c in tbl[0]]
+    data = tbl[1]
+
+    def _col(val):
+        try:
+            return header.index(val)
+        except ValueError:
+            return None
+
+    volts = data[_col("VOLTS")] if _col("VOLTS") is not None and _col("VOLTS") < len(data) else ""
+    amp = data[_col("AMP")] if _col("AMP") is not None and _col("AMP") < len(data) else ""
+    watt = data[_col("WATT")] if _col("WATT") is not None and _col("WATT") < len(data) else ""
+
+    return volts, amp, watt
 
 def load_assembly_numbers():
     """Fetch all unique assembly numbers for the selected motor model."""
@@ -210,8 +315,15 @@ def load_data():
               data_row.iloc[12] if len(data_row)>12 else None)
 
         date_var.set(str(data_row.iloc[0]))
-        dimension_var.set(assembly_no)
-        no_load_var.set(str(data_row.iloc[26] if len(data_row) > 26 else "N/A"))
+
+        # Load no-load test values from the external sheet (Book1.xlsx) based on assembly number
+        no_load_values = _get_no_load_test_values(assembly_no)
+        if no_load_values:
+            volts, amp, watt = no_load_values
+            no_load_var.set(f"{volts} V / {amp} A / {watt} W")
+        else:
+            no_load_var.set(str(data_row.iloc[26] if len(data_row) > 26 else "N/A"))
+
         locked_var.set(str(data_row.iloc[30] if len(data_row) > 30 else "N/A"))
 
         # === Compute resistance & ambient temperature from test_data.xlsx ===
@@ -334,11 +446,11 @@ def extract_table_for_assembly(df, asm):
     return rows
 
 
-def generate_pdf():
+def generate_pdf(output_path=None, open_pdf=True):
     try:
         from reportlab.platypus import Paragraph
         from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, HRFlowable
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, HRFlowable, Image
         from reportlab.lib import colors
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
@@ -415,21 +527,98 @@ def generate_pdf():
         # Save to Desktop
         desktop = os.path.expanduser("~\\Desktop")
         os.makedirs(desktop, exist_ok=True)
-        pdf_path = os.path.join(desktop, "certificate.pdf")
+        pdf_path = output_path or os.path.join(desktop, "certificate.pdf")
         
+        # Use larger margins to reserve space for the page header.
         doc = SimpleDocTemplate(
             pdf_path,
             pagesize=(8.27*inch, 11.69*inch),
-            topMargin=20,
-            bottomMargin=20,
-            leftMargin=20,
-            rightMargin=20
+            topMargin=1.25*inch,
+            bottomMargin=0.75*inch,
+            leftMargin=0.4*inch,
+            rightMargin=0.75*inch
         )
         styles = getSampleStyleSheet()
+        styles['Heading3'].fontSize = 11
+        styles['Heading3'].leading = 13
+        styles['Heading3'].spaceBefore = 2
+        styles['Heading3'].spaceAfter = 3
+        styles['Heading4'].fontSize = 10
+        styles['Heading4'].leading = 12
+        styles['Heading4'].spaceBefore = 2
+        styles['Heading4'].spaceAfter = 3
         
         # Custom style for centered title
         title_style = ParagraphStyle(name='CustomTitle', parent=styles['Heading1'],
                                      alignment=1, fontSize=16, textColor=colors.black)
+
+        # Custom styles for Visual Inspection section
+        inspection_heading_style = ParagraphStyle(
+            name='InspectionHeading',
+            parent=styles['Heading3'],
+            fontSize=11,
+            leading=14,
+            spaceBefore=4,
+            spaceAfter=2,
+        )
+
+        inspection_body_style = ParagraphStyle(
+            name='InspectionBody',
+            parent=styles['Normal'],
+            fontSize=9,
+            leading=11,
+            leftIndent=8,
+            spaceBefore=2,
+            spaceAfter=4,
+        )
+        table_bold_small_style = ParagraphStyle(
+            name='TableBoldSmall',
+            parent=styles['Normal'],
+            fontSize=7,
+            leading=8,
+        )
+        locked_bold_small_style = ParagraphStyle(
+            name='LockedBoldSmall',
+            parent=styles['Normal'],
+            fontSize=7,
+            leading=8,
+        )
+        dielectric_bold_small_style = ParagraphStyle(
+            name='DielectricBoldSmall',
+            parent=styles['Normal'],
+            fontSize=7,
+            leading=8,
+        )
+        dielectric_body_small_style = ParagraphStyle(
+            name='DielectricBodySmall',
+            parent=styles['Normal'],
+            fontSize=7,
+            leading=8,
+        )
+        vibration_bold_small_style = ParagraphStyle(
+            name='VibrationBoldSmall',
+            parent=styles['Normal'],
+            fontSize=7,
+            leading=8,
+        )
+        vibration_body_small_style = ParagraphStyle(
+            name='VibrationBodySmall',
+            parent=styles['Normal'],
+            fontSize=7,
+            leading=8,
+        )
+        bottom_bold_small_style = ParagraphStyle(
+            name='BottomBoldSmall',
+            parent=styles['Normal'],
+            fontSize=6.5,
+            leading=7.5,
+        )
+        bottom_body_small_style = ParagraphStyle(
+            name='BottomBodySmall',
+            parent=styles['Normal'],
+            fontSize=6.5,
+            leading=7.5,
+        )
         
         # ===== LOGO / STAMP SETTINGS =====
         # Place 'logo.png' and 'stamp.png' next to this script (same folder), or bundle via PyInstaller.
@@ -470,7 +659,7 @@ def generate_pdf():
             scale = min(maxw / iw, maxh / ih)
             return iw * scale, ih * scale
 
-        def draw_logo_and_stamp(canvas, doc):
+        def draw_header(canvas, doc):
             def _log(msg: str):
                 try:
                     log_path = os.path.join(os.path.expanduser("~"), "Desktop", "telema_resource_log.txt")
@@ -481,21 +670,55 @@ def generate_pdf():
 
             try:
                 from reportlab.lib.utils import ImageReader
+                page_top = doc.pagesize[1]
+                header_left = doc.leftMargin
+                header_right = doc.pagesize[0] - doc.rightMargin
 
-                # Draw logo on second page (top-right)
-                if canvas.getPageNumber() == 1 and os.path.exists(logo_path):
+                logo_width = 0
+                logo_gap = 0.18 * inch
+                logo_x = header_left
+                logo_y = page_top - 0.92 * inch
+
+                # Draw logo on all pages (top-left)
+                if os.path.exists(logo_path):
                     img = ImageReader(logo_path)
-                    width, height = _fit_image_dims(img, 2.0*inch, 0.8*inch)
-                    x = doc.pagesize[0] - doc.rightMargin - width
-                    y = doc.pagesize[1] - doc.topMargin - height + 6
-                    canvas.drawImage(img, x, y, width=width, height=height, preserveAspectRatio=True, mask='auto')
-                    _log(f"logo drawn at ({x:.1f},{y:.1f}) size {width:.1f}x{height:.1f}")
+                    width, height = _fit_image_dims(img, 1.55*inch, 0.7*inch)
+                    canvas.drawImage(img, logo_x, logo_y, width=width, height=height, preserveAspectRatio=True, mask='auto')
+                    logo_width = width
+                    _log(f"logo drawn at ({logo_x:.1f},{logo_y:.1f}) size {width:.1f}x{height:.1f}")
 
-                # Draw stamp on second page (bottom-right, slightly inset)
-                if canvas.getPageNumber() == 2 and os.path.exists(stamp_path):
+                canvas.saveState()
+                text_x = header_left + logo_width + (logo_gap if logo_width else 0)
+
+                canvas.setFont("Helvetica-Bold", 17)
+                canvas.drawString(text_x, page_top - 0.46*inch, "Routine Test Report")
+
+                canvas.setFont("Helvetica", 10)
+                canvas.drawString(text_x, page_top - 0.67*inch, plain_motor_spec)
+
+                canvas.setFont("Helvetica", 9)
+                canvas.drawString(
+                    text_x,
+                    page_top - 0.86*inch,
+                    "Ref : RDSO : E - 10/3/09 / IS 12615 / EN 60034 / Customer Specifications"
+                )
+
+                # Separator line
+                line_y = page_top - 0.97*inch
+                canvas.setLineWidth(0.8)
+                canvas.line(header_left, line_y, header_right, line_y)
+
+                # Company info below separator
+                canvas.setFont("Helvetica", 10)
+                company_text = "Power Drives (Guj) Pvt. Ltd., Vadodara - 390 010."
+                canvas.drawString(header_left, page_top - 1.11*inch, company_text)
+
+                canvas.restoreState()
+
+                # Draw stamp on all pages (bottom-right, slightly inset)
+                if os.path.exists(stamp_path):
                     img = ImageReader(stamp_path)
                     width, height = _fit_image_dims(img, 1.8*inch, 1.2*inch)
-                    # offsets help place the stamp where the user circled it
                     x_offset = 2 * inch  # move stamp left from right margin
                     y_offset = 0.1 * inch  # move stamp up from bottom margin
                     x = doc.pagesize[0] - doc.rightMargin - width - x_offset
@@ -503,53 +726,48 @@ def generate_pdf():
                     canvas.drawImage(img, x, y, width=width, height=height, preserveAspectRatio=True, mask='auto')
             except Exception as e:
                 # Don't interrupt PDF generation on image errors
-                print("WARNING: failed to draw logo/stamp:", e)
+                print("WARNING: failed to draw header/stamp:", e)
 
         elements = []
 
-        
-        # ===== HEADER =====
-        elements.append(Paragraph("<b>Routine Test Report</b>", title_style))
-        elements.append(Spacer(1, 0.1*inch))
-        
-        # Motor spec line
+        # ===== HEADER helper =====
+        # Prepare the motor spec string used by the header drawing function
         kw = str(param_row.iloc[2]) if len(param_row) > 2 else ""
         hp = str(param_row.iloc[3]) if len(param_row) > 3 else ""
         voltage = str(param_row.iloc[5]) if len(param_row) > 5 else ""
         freq = str(param_row.iloc[7]) if len(param_row) > 7 else ""
-        motor_spec = f"<b>21.5kw-31.0kw / 2 pole , {voltage}V, {freq}Hz, 3 Phase induction motor</b>"
-        elements.append(Paragraph(motor_spec, styles['Normal']))
+        plain_motor_spec = f"21.5kw-31.0kw / 2 pole , {voltage}V, {freq}Hz, 3 Phase induction motor"
+        motor_spec = f"<b>{plain_motor_spec}</b>"
+
+        elements.append(Spacer(1, 0.08*inch))
         
+        def _build_motor_line():
+            t = Table(
+                [[
+                    Paragraph(f"<b>Motor Sr. No:</b> {motor_sr_var.get()}", styles['Normal']),
+                    Paragraph(f"<u><b>Date:</b></u> {date_var.get()}", styles['Normal'])
+                ]],
+                colWidths=[3.8*inch, 2.2*inch]
+            )
+            t.setStyle([
+                ('ALIGN', (0,0), (0,0), 'LEFT'),
+                ('ALIGN', (1,0), (1,0), 'RIGHT'),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('LEFTPADDING', (0,0), (-1,-1), 0),
+                ('RIGHTPADDING', (0,0), (-1,-1), 0),
+                ('TOPPADDING', (0,0), (-1,-1), 0),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+            ])
+            t.hAlign = 'LEFT'
+            return t
 
-
-        
-        # Company info
-        elements.append(Paragraph("Ref : RDSO : E - 10/3/09 / IS 12615 / EN 60034/ Customer Specifications", styles['Normal']))
-
-        # line ABOVE the Ref text
-        elements.append(Spacer(1,5))
-        elements.append(HRFlowable(width="100%", thickness=1, color=colors.black))
-        elements.append(Spacer(1,5))
-
-        elements.append(Paragraph(
-        "<para alignment='right'><b>Power Drives (Guj) Pvt. Ltd., Vadodara - 390 010.</b></para>",
-        styles['Normal']))
-        elements.append(Spacer(1, 0.1*inch))
-        
-        # Motor details header
-        motor_line = Table(
-    [[f"Motor Sr. No: {motor_sr_var.get()}", f"Date: {date_var.get()}"]],
-    colWidths=[4*inch, 2*inch]
-)
-
-        motor_line.setStyle([
-        ('ALIGN',(1,0),(1,0),'RIGHT')
-        ])
+        # Motor details row below the header separator
+        motor_line = _build_motor_line()
 
         elements.append(motor_line)
-        elements.append(Spacer(1,10))
+        elements.append(Spacer(1, 4))
         elements.append(Paragraph("<u><b>Name Plate Data</b></u>", styles['Normal']))
-        elements.append(Spacer(1, 0.1*inch))
+        elements.append(Spacer(1, 0.05*inch))
         
         # ===== NAME PLATE DATA TABLE =====
         name_plate = [
@@ -569,433 +787,889 @@ def generate_pdf():
              "ENCL", str(param_row.iloc[17]) if len(param_row) > 17 else "", 
              "", "", "IP", "65"]
         ]
-        t_plate = Table(name_plate, colWidths=[0.7*inch, 0.9*inch, 0.9*inch, 0.9*inch, 
-                                                0.7*inch, 0.9*inch, 0.7*inch, 0.9*inch])
-        t_plate.setStyle([('GRID', (0,0), (-1,-1), 0.5, colors.black)])
+        t_plate = Table(
+            name_plate,
+            colWidths=[0.7*inch, 0.9*inch, 0.9*inch, 0.9*inch, 0.7*inch, 0.9*inch, 0.7*inch, 0.9*inch],
+            rowHeights=[0.22*inch] * len(name_plate)
+        )
+        t_plate.hAlign = 'LEFT'
+        t_plate.setStyle([
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+            ('FONTSIZE', (0,0), (-1,-1), 10),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ])
         elements.append(t_plate)
-        elements.append(Spacer(1, 0.05*inch))
+        elements.append(Spacer(1, 0.01*inch))
         
         # ===== VISUAL INSPECTION =====
-        elements.append(Paragraph("<u><b>Visual Inspection</b></u>", styles['Heading3']))
-        elements.append(Paragraph("1) Motor Painting &amp; casting finish found accepted", styles['Normal']))
-        elements.append(Paragraph("2) Direction of Rotation found clockwise for R.Y. B .", styles['Normal']))
-        elements.append(Paragraph("3) 'V' ring Provided.", styles['Normal']))
-        elements.append(Paragraph("4) Vibration Velocity in mm/sec 0.4 ( With Half Key )", styles['Normal']))
-        elements.append(Spacer(1, 0.05*inch))
-        
-        # Dimensions table - use manual entries
-        dim_table = [
-            ["Dimension", "Shaft Diameter", "A - Distance", "B - Distance", "Mounting hole diameter\n at foot", "Total Length", "Pcd", "Mounting hole Diameter \nat flange"],
-            ["Tolerance", "+0.010 / -0.00", "+0.1 / -0.1", "+0.1 / -0.1", "+0.1 / -0.1", "+3.0 / -3.0", "+0.5 / -0.5" , "+0.05 / -0.00"],
-            ["Actual dimension", shaft_dia_var.get(), a_dist_var.get(), b_dist_var.get(), mount_hole_var.get(), total_length_var.get(), pcd_var.get() , flange_var.get()], 
-            ["Results", "Accepted", "Accepted", "Accepted", "Accepted", "Accepted", "Accepted" , "Accepted"]
-        ]
-        t_dim = Table(dim_table, colWidths=[0.9*inch, 0.9*inch, 0.8*inch, 0.8*inch, 1.5*inch, 0.8*inch, 0.6*inch , 1.5*inch])     
-        t_dim.setStyle([('GRID', (0,0), (-1,-1), 0.5, colors.black),
-                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
-                        ('ALIGN',(0,0),(-1,-1),'CENTER'),
-                        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
-                        ('FONTSIZE',(0,0),(-1,-1),8)])
-        elements.append(t_dim)
-        elements.append(Paragraph("Note : All dimensions are in mm.", styles['Normal']))
-        elements.append(Spacer(1, 0.1*inch))
-        
-        # ===== DIELECTRIC TEST =====
-        # ===== DIELECTRIC TEST =====
-        elements.append(Spacer(1,0.05*inch))
+        elements.append(Paragraph("<u><b>Visual Inspection</b></u>", inspection_heading_style))
+        elements.append(Paragraph(
+            "1) Motor Paint found accepted<br/>"
+            "2) High Speed & Low Speed sleeves red and blue respectively with U,V,W ferruls found ok<br/>"
+            "3) Fan secured with key, circlip & wash<br/>"
+            "4) Cable Gland provision on left side looking from DE side<br/>"
+            "5) Min DFT found on overall motor 135 micron<br/>"
+            "6) Flange orientation off center wrt terminal box<br/>"
+            "7) Earthing tapped hole provided inside terminal box and outer frame",
+            inspection_body_style
+        ))
+        elements.append(Spacer(1, 0.08*inch))
 
-        d_title = Paragraph("<u><b>Dielectric Test</b></u>", styles['Heading3'])
+        elements.append(Paragraph("<u><b>0.5 Kw/ 4Pole - Low Speed Test Results of Duel Speed motor</b></u>", styles['Heading4']))
+        # Resistance Test table (like screenshot)
+        res_mode = resistance_mode_var.get()
+        conn_type = connection_type_var.get()
 
-        dielec_data = [
-        ["Voltage", "Time", "Result"],
-        ["2.0 kV", "60 Sec", "Withstood"]
-        ]
+        # Raw resistance values (from test_data.xlsx)
+        u_raw = _parse_float(data_row.iloc[8] if len(data_row) > 8 else None, None)
+        v_raw = _parse_float(data_row.iloc[10] if len(data_row) > 10 else None, None)
+        w_raw = _parse_float(data_row.iloc[12] if len(data_row) > 12 else None, None)
 
-        t_dielec = Table(dielec_data, colWidths=[0.6*inch,0.6*inch,0.8*inch], hAlign='LEFT')
-        t_dielec.setStyle([
-        ('GRID',(0,0),(-1,-1),0.5,colors.black),
-        ('ALIGN',(0,0),(-1,-1),'LEFT')
-        ])
+        def _safe_round(val):
+            return round(val, 3) if val is not None else ""
 
+        def _to_20deg(val):
+            if val in ("", None):
+                return ""
+            return _safe_round(val / (1 + alpha * (ambient_temp - 20)))
 
-        # ===== INSULATION RESISTANCE =====
-        i_title = Paragraph("<u><b>Insulation Resistance Test</b></u>", styles['Heading3'])
+        # Determine displayed line/phase values based on selection
+        if res_mode == "Line":
+            # Raw readings are assumed to be line resistances
+            line_u, line_v, line_w = u_raw, v_raw, w_raw
 
-        insul_data = [
-        ["Voltage (DC)", "Insulation Resistance at 60 Sec."],
-        ["1000 V", ">40 G Ohm"]
-        ]
+            if conn_type == "Star":
+                # In Star connection, phase resistance is typically half of line resistance
+                line_u = _safe_round(u_raw / 2) if u_raw is not None else ""
+                line_v = _safe_round(v_raw / 2) if v_raw is not None else ""
+                line_w = _safe_round(w_raw / 2) if w_raw is not None else ""
+                phase_u = line_u
+                phase_v = line_v
+                phase_w = line_w
+                conn_desc = "Line resistance (Star)"
 
-        t_insul = Table(insul_data, colWidths=[1*inch,2.0*inch])
-        t_insul.setStyle([
-        ('GRID',(0,0),(-1,-1),0.5,colors.black),
-        ('ALIGN',(0,0),(-1,-1),'CENTER')
-        ])
+                # 20°C correction for line values is derived from phase correction
+                line_resistance_20 = _safe_round(resistance_20 / 2)
+            else:
+                # TODO: apply delta conversion formula here once provided.
+                # For now, use raw values as placeholder.
+                line_u = _safe_round(u_raw * 3) if u_raw is not None else ""
+                phase_u = line_u
+                line_v = _safe_round(v_raw * 3) if v_raw is not None else ""
+                phase_v = line_v
+                line_w = _safe_round(w_raw * 3) if w_raw is not None else ""
+                phase_w = line_w
+                conn_desc = "Line resistance (Delta)"
 
+                # Placeholder: treat 20°C correction as same as phase for now
+                line_resistance_20 = _to_20deg(_safe_round((line_u + line_v + line_w) / 3))
 
-        # ===== SIDE BY SIDE LAYOUT =====
-        layout = Table([
-        [d_title, i_title],
-        [t_dielec, t_insul]
-        ], colWidths=[3.15*inch,3.15*inch])
+            # Use line resistance as the displayed column values in Line mode
+            display_u, display_v, display_w = line_u, line_v, line_w
+            display_20 = line_resistance_20
+            display_label = "Resistance per Line (cold)"
 
-        layout.setStyle([
-('LEFTPADDING',(0,0),(-1,-1),0),
-('RIGHTPADDING',(0,0),(-1,-1),0),
-('TOPPADDING',(0,0),(-1,-1),0),
-('BOTTOMPADDING',(0,0),(-1,-1),0),
+        else:
+            # Phase mode: raw values are phase resistance
+            phase_u = _safe_round(u_raw / 2) if u_raw is not None else ""
+            phase_v = _safe_round(v_raw / 2) if v_raw is not None else ""
+            phase_w = _safe_round(w_raw / 2) if w_raw is not None else ""
+            conn_desc = "Phase resistance"
 
-('ALIGN',(0,1),(0,1),'LEFT')  # force dielectric table to left
-])
+            # Convert to line (assuming star connection) for completeness
+            line_u = _safe_round(u_raw / 2) if u_raw is not None else ""
+            line_v = _safe_round(v_raw / 2) if v_raw is not None else ""
+            line_w = _safe_round(w_raw / 2) if w_raw is not None else ""
 
-        elements.append(layout)
-        elements.append(Spacer(1,0.1*inch))
-        # ===== TEST RESULTS =====
-        result_title = f"<u><b>21.5kw-31.0kw/ 2Pole - Test Results of motor</b></u>"
-        elements.append(Paragraph(result_title, styles['Heading3']))
-        
-        # Resistance Test
-        styles = getSampleStyleSheet()
+            display_u, display_v, display_w = phase_u, phase_v, phase_w
+            display_20 = _to_20deg(_safe_round((phase_u + phase_v + phase_w) / 3))
+            display_label = "Resistance per Phase (cold)"
 
-        resistance = [
+        def _avg(vals):
+            nums = [v for v in vals if isinstance(v, (int, float))]
+            return _safe_round(sum(nums) / len(nums)) if nums else ""
+
+        line_avg = _avg([line_u, line_v, line_w])
+        phase_avg = _avg([phase_u, phase_v, phase_w])
+        display_u_20 = _to_20deg(phase_u)
+        display_v_20 = _to_20deg(phase_v)
+        display_w_20 = _to_20deg(phase_w)
+        display_avg = _avg([display_u, display_v, display_w])
+        display_avg_20 = _to_20deg(phase_avg)
+
+        # Build a single-table Resistance Test layout matching the screenshot.
+        # This uses fixed column widths so the measurement text takes the full middle column.
+
+        resist_data = [
             [
-                Paragraph("<b>Resistance<br/>Test</b>", styles['Normal']),
-                "",
-                Paragraph("Resistance per Phase at Ambient Temperature (cold)", styles['Normal']),
-                Paragraph(f"{resistance_cold} Ω", styles['Normal']),
-                Paragraph(f"Ambient Temp {ambient_temp} °C", styles['Normal'])
+                Paragraph("<b>Resistance Test</b>", styles['Normal']),
+                Paragraph("<b>RDSO E-10/3/09 - 19.7.1</b>", styles['Normal']),
+                Paragraph("Measurement of resistance (cold). The\n resistance of each phase winding of the\n stator, when cold, shall be measured\n either by bridge or by voltage drop \nmethod", styles['Normal']),
+                Paragraph(f"<b>Ambient Temperature {round(ambient_temp,1)} Deg C</b>", styles['Normal']),
+                "", ""
             ],
             [
-                "",
-                "",
-                Paragraph("Resistance per Phase at 20 °C", styles['Normal']),
-                Paragraph(f"{resistance_20} Ω", styles['Normal']),
-                
+                "", "", "", Paragraph(f"<b>{display_label}</b>", styles['Normal']), "", ""
+            ],
+            [
+                "", "", "", Paragraph("<b>Phase</b>", styles['Normal']), Paragraph("<b> Phase \nResistance</b>", styles['Normal']), Paragraph("<b>Resistance at 20 Deg C</b>", styles['Normal'])
+            ],
+            ["", "", "", "U", display_u, display_u_20],
+            ["", "", "", "V", display_v, display_v_20],
+            ["", "", "", "W", display_w, display_w_20],
+            ["", "", "", "Avg", display_avg, display_avg_20],
+            [
+                Paragraph(f"Resistance per phase of Type Tested motor 6.54 Ohms at 20 Deg C, should be ± 5%", styles['Normal']),
+                "", "", "", "", Paragraph("- Accepted", styles['Normal'])
             ]
         ]
 
-        t_resist = Table(
-            resistance,
-            colWidths=[1*inch, 0.8*inch, 2.2*inch, 1.2*inch, 1.6 *inch],
-            rowHeights=[0.5*inch, 0.5*inch]
-        )
+        # Make row 3 (measurement text row) slightly taller to allow wrapping,
+        # but keep the table compact so the No Load test can remain on page 1.
+        row_heights = [0.22*inch] * len(resist_data)
+        if len(row_heights) > 2:
+            row_heights[2] = 0.35*inch
+        if len(row_heights) > 7:
+            row_heights[7] = 0.34*inch
 
+        t_resist = Table(
+            resist_data,
+            colWidths=[1*inch, 0.9*inch, 2.3*inch, 0.65*inch, 0.9*inch, 1*inch],
+            rowHeights=row_heights
+        )
+        t_resist.hAlign = 'LEFT'
         t_resist.setStyle([
-            ('GRID',(0,0),(-1,-1),0.5,colors.black),
-            ('SPAN',(0,0),(0,1)),   # Resistance Test
-            ('SPAN',(1,0),(1,1)),   # blank column
-            ('SPAN',(4,0),(4,1)),   # Resistance per Phase label                
-            ('ALIGN',(0,0),(-1,-1),'CENTER'),
-            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
-            ('FONTSIZE',(0,0),(-1,-1),8)
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+            ('SPAN', (0,0), (0,6)),
+            ('SPAN', (1,0), (1,6)),
+            ('SPAN', (2,0), (2,6)),
+            ('SPAN', (0,7), (2,7)),
+            ('SPAN', (3,0), (5,0)),
+            ('SPAN', (3,1), (5,1)),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('ALIGN', (2,0), (2,6), 'LEFT'),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('FONTSIZE', (0,0), (-1,-1), 10),
+        ])
+        elements.append(t_resist)
+        # Give more breathing room between the Resistance table and the Direction of Rotation table
+        elements.append(Spacer(1, 0.08*inch))
+
+        # Direction of Rotation table (placed after resistance test)
+        direction_data = [
+            [
+                Paragraph("<b>Direction of Rotation</b>", styles['Normal']),
+                Paragraph("<b>RDSO E-10/3/09 - 19.7.2</b>", styles['Normal']),
+                Paragraph(
+                    "Direction of rotation should be same as that marked on the motor when supply phase sequence RYB is connected to U,V,W terminals",
+                    styles['Normal']
+                
+                )
+            ],
+            [
+                "", "", Paragraph(
+                    "Motor rotates in Anticlock direction (DE) when R,Y,B phase are connected to respective terminals marked U, V, W.",
+                    styles['Normal']
+                )
+            ]
+        ]
+
+        # Align direction table width with the resistance table width
+        resist_table_width = 1*inch + 0.9*inch + 2.3*inch + 0.65*inch + 0.9*inch + 0.9*inch
+        scale = resist_table_width / (1.2*inch + 1.6*inch + 2.6*inch)
+        t_direction = Table(
+            direction_data,
+            colWidths=[1.2*inch*scale, 1.6*inch*scale, 2.6*inch*scale]
+        )
+        t_direction.hAlign = 'LEFT'
+        t_direction.setStyle([
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+            ('SPAN', (0,0), (0,1)),
+            ('SPAN', (1,0), (1,1)),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('FONTSIZE', (0,0), (-1,-1), 10),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER')
+        ])
+        elements.append(t_direction)
+        elements.append(Spacer(1, 0.08*inch))
+
+        # Insert a page break so the No Load Test begins cleanly on a new page.
+        elements.append(PageBreak())
+        elements.append(Spacer(1, 0.12*inch))
+        elements.append(_build_motor_line())
+        elements.append(Spacer(1, 4))
+
+        # ---- No Load Test ----
+        elements.append(Paragraph("<u><b>No Load Test</b></u>", styles['Heading3']))
+
+        tbl = _extract_no_load_table(assembly_no)
+
+        def _find_header_row(table):
+            for idx, row in enumerate(table):
+                joined = " ".join(str(c).strip().lower() for c in row if c is not None)
+                if "%voltage" in joined or ("volts" in joined and "amp" in joined) or "watt" in joined:
+                    return idx
+            return None
+
+        def _find_column_indices(header_row):
+            # Desired columns in order of appearance
+            desired = [
+                "%voltage", "volts", "amp", "watt",
+                "current ratio", "value of type tested motor", "remark"
+            ]
+            indices = []
+            row = [str(x).strip().lower() for x in header_row]
+            for key in desired:
+                idx = next((i for i, v in enumerate(row) if key in v), None)
+                indices.append(idx)
+            return indices
+
+        def _build_noload_table(table):
+            hdr_idx = _find_header_row(table)
+            if hdr_idx is None:
+                return None
+
+            header_row = table[hdr_idx]
+            lower_row = [str(x).strip().lower() for x in header_row]
+
+            def _find_col(*keys):
+                for key in keys:
+                    idx = next((i for i, v in enumerate(lower_row) if key in v), None)
+                    if idx is not None:
+                        return idx
+                return None
+
+            idx_pct = _find_col("%voltage", "% voltage")
+            idx_volts = _find_col("volts", "volt")
+            idx_amp = _find_col("amp", "amps")
+            idx_watt = _find_col("watt", "watts")
+            idx_cur_ratio = _find_col("current ratio")
+            idx_type_tested = _find_col("value of type tested motor", "type tested motor")
+            idx_remark = _find_col("remark")
+
+            if None in (idx_pct, idx_volts, idx_amp, idx_watt, idx_cur_ratio):
+                return None
+
+            type_amp_idx = idx_type_tested
+            type_ratio_idx = None
+            if idx_type_tested is not None:
+                candidate = idx_type_tested + 1
+                if idx_remark is None or candidate < idx_remark:
+                    type_ratio_idx = candidate
+
+            data_start = hdr_idx + 1
+            if data_start < len(table):
+                maybe_subheader = " ".join(str(x).strip().lower() for x in table[data_start] if x is not None)
+                if "amp" in maybe_subheader and "current ratio" in maybe_subheader:
+                    data_start += 1
+
+            data_rows = []
+            for row in table[data_start:]:
+                if all(not str(x).strip() for x in row):
+                    continue
+
+                def _cell(idx):
+                    return str(row[idx]).strip() if idx is not None and idx < len(row) else ""
+
+                if not any(_cell(idx) for idx in (idx_pct, idx_volts, idx_amp, idx_watt)):
+                    continue
+
+                data_rows.append([
+                    _cell(idx_pct),
+                    _cell(idx_volts),
+                    _cell(idx_amp),
+                    _cell(idx_watt),
+                    _cell(idx_cur_ratio),
+                    _cell(type_amp_idx),
+                    _cell(type_ratio_idx),
+                    _cell(idx_remark),
+                ])
+                if len(data_rows) >= 3:
+                    break
+
+            if not data_rows:
+                return None
+
+            final = [
+                [
+                    Paragraph("<b>No Load Test</b>", table_bold_small_style),
+                    Paragraph("<b>RDSO E-10/3/09 -<br/>19.7.3</b>", table_bold_small_style),
+                    Paragraph(
+                        "The ratio of no load\ncurrent at 457 V shall\nnot exceed the value\nachieved during type\ntest",
+                        styles['Normal'],
+                    ),
+                    Paragraph("<b>%Voltage</b>", table_bold_small_style),
+                    Paragraph("<b>Volts</b>", table_bold_small_style),
+                    Paragraph("<b>AMP</b>", table_bold_small_style),
+                    Paragraph("<b>WATT</b>", table_bold_small_style),
+                    Paragraph("<b>Current Ratio</b>", table_bold_small_style),
+                    Paragraph("<b>Values of Type Tested<br/>motor</b>", table_bold_small_style),
+                    "",
+                    Paragraph("<b>Remark</b>", table_bold_small_style),
+                ],
+                [
+                    "", "", "",
+                    "", "", "", "", "",
+                    Paragraph("<b>Amp</b>", table_bold_small_style),
+                    Paragraph("<b>Current Ratio</b>", table_bold_small_style),
+                    ""
+                ],
+            ]
+
+            for row_idx, dr in enumerate(data_rows):
+                remark_value = dr[7] if row_idx == 0 and dr[7] else ("Accepted" if row_idx == 0 else "")
+                final.append([
+                    "", "", "",
+                    dr[0], dr[1], dr[2], dr[3], dr[4], dr[5], dr[6], remark_value
+                ])
+
+            col_widths = [
+                0.7 * inch, 0.72 * inch, 1.25 * inch,
+                0.66 * inch, 0.54 * inch, 0.5 * inch, 0.57 * inch, 0.6 * inch,
+                0.5 * inch, 0.7 * inch, 0.54 * inch
+            ]
+            row_heights = [0.28 * inch, 0.2 * inch] + [0.18 * inch] * len(data_rows)
+
+            t = Table(final, colWidths=col_widths, rowHeights=row_heights, repeatRows=2, splitByRow=1)
+            t.hAlign = 'LEFT'
+            t.setStyle([
+                ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+                ('FONTSIZE', (0,0), (-1,-1), 8),
+                ('LEADING', (0,0), (-1,-1), 9),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('ALIGN', (2,0), (2,-1), 'LEFT'),
+                ('ALIGN', (10,0), (10,-1), 'CENTER'),
+                ('SPAN', (0,0), (0, len(final)-1)),
+                ('SPAN', (1,0), (1, len(final)-1)),
+                ('SPAN', (2,0), (2, len(final)-1)),
+                ('SPAN', (3,0), (3,1)),
+                ('SPAN', (4,0), (4,1)),
+                ('SPAN', (5,0), (5,1)),
+                ('SPAN', (6,0), (6,1)),
+                ('SPAN', (7,0), (7,1)),
+                ('SPAN', (8,0), (9,0)),
+                ('SPAN', (10,0), (10,1)),
+                ('SPAN', (10,2), (10, len(final)-1)),
+            ])
+            return t
+
+        t_noload = _build_noload_table(tbl) if tbl else None
+        if not t_noload:
+            t_noload = Table([
+                ["No Load Test", "(no data found for this assembly)"]
+            ], colWidths=[2*inch, 4*inch])
+            t_noload.hAlign = 'LEFT'
+            t_noload.setStyle([
+                ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ])
+
+        elements.append(t_noload)
+        elements.append(Spacer(1, 0.05*inch))
+        
+        # Locked Rotor Test (formatted to match screenshot layout)
+        elements.append(Paragraph("<u><b>Locked Rotor Test</b></u>", styles['Heading3']))
+
+        locked = [
+            [
+                Paragraph("<b>Locked Rotor Test</b>", locked_bold_small_style),
+                Paragraph("<b>RDSO E-10/3/09 - 19.7.4</b>", locked_bold_small_style),
+                Paragraph("A single test at any reduced balanced input voltage as per IS 4029-1991", styles['Normal']),
+                Paragraph("<b>Volts</b>", locked_bold_small_style),
+                Paragraph("<b>Amps</b>", locked_bold_small_style),
+                Paragraph("<b>Watts</b>", locked_bold_small_style),
+                Paragraph("<b>Kg.1 mtr</b>", locked_bold_small_style),
+                Paragraph("<b>Declared Value</b>", locked_bold_small_style),
+                Paragraph("<b>Remark</b>", locked_bold_small_style)
+            ],
+            [
+                "", "", "",
+                str(data_row.iloc[56] if len(data_row) > 56 else ""),
+                str(data_row.iloc[61] if len(data_row) > 61 else ""),
+                str(data_row.iloc[63] if len(data_row) > 63 else ""),
+                str(data_row.iloc[66] if len(data_row) > 66 else ""),
+                
+            ],
+             [
+        "", "", "",
+        Paragraph("<b>% starting torque</b>", locked_bold_small_style),
+        "",
+        "210%","",                # 👈 your value
+        "200 % minimum",
+        "Accepted"
+    ]
+        ]
+
+        t_locked = Table(locked, colWidths=[1*inch, 0.9*inch, 1.9*inch, 0.6*inch, 0.6*inch, 0.55*inch, 0.5*inch, 0.9*inch, 0.8*inch])
+        t_locked.hAlign = 'LEFT'
+        t_locked.setStyle([
+        ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+
+        # Left side vertical merge
+        ('SPAN', (0,0), (0,2)),  # Locked Rotor Test
+        ('SPAN', (1,0), (1,2)),  # RDSO
+        ('SPAN', (2,0), (2,2)),  # Description
+
+        # Right side vertical merge
+        ('SPAN', (7,0), (7,1)),  # Declared Value ✅ FIXED
+        ('SPAN', (8,0), (8,1)),  # Remark
+
+        # % starting torque row merge (middle columns)
+        ('SPAN', (3,2), (4,2)),
+
+        # Alignment
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+
+        ('FONTSIZE', (0,0), (-1,-1), 8),
+    ])
+        elements.append(t_locked)
+        elements.append(Spacer(1, 0.2*inch))
+
+        # ===== DIELECTRIC + INSULATION TABLE =====
+
+        dielec_table = [
+            [
+                Paragraph("<b>Dielectric (High Voltage) Test & Insulation Resistance Test</b>", dielectric_bold_small_style),
+                Paragraph("<b>RDSO E-10/3/09 - 19.7.6</b><br/>On hot winding's, perform the electrical test at 3300V, 50 Hz applied for one minutes between each insulated stator winding and the frame of the motor and record the insulation resistance before and after the high voltage tests in terms of IS : 325-1991. There should be no appreciable difference in insulation resistance values.", dielectric_body_small_style),
+                Paragraph("<b>Tests</b>", dielectric_bold_small_style),
+                Paragraph("<b>Required</b>", dielectric_bold_small_style),
+                Paragraph("<b>Result</b>", dielectric_bold_small_style),
+                Paragraph("<b>Remark</b>", dielectric_bold_small_style)
+            ],
+            [
+                "", "",
+                "Dielectric Test 2.64kV at 1 min (HV)",
+                "Withstand",
+                "Withstood",
+                "Accepted"
+            ],
+            [
+                "", "",
+                "Insulation Resistance test (500v DC) before HV",
+                "≥ 200 M Ohm",
+                "677 M Ohm",
+                "Accepted"
+            ],
+            [
+                "", "",
+                "Insulation Resistance test (500v DC) after HV",
+                "≥ 200 M Ohm",
+                "645 M Ohm",
+                "Accepted"
+            ]
+        ]
+        t_dielec = Table(
+            dielec_table,
+            colWidths=[1.2*inch, 1.95*inch, 2.43*inch, 0.8*inch, 0.7*inch, 0.67*inch]
+        )
+        t_dielec.hAlign = 'LEFT'
+
+        t_dielec.setStyle([
+            ('GRID', (0,0), (-1,-1), 0.05, colors.black),
+
+            # LEFT SIDE FULL MERGE
+            ('SPAN', (0,0), (0,3)),  # Test name
+            ('SPAN', (1,0), (1,3)),  # Description
+
+            # ALIGNMENT
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+
+            # LEFT ALIGN description text
+            ('ALIGN', (1,0), (1,3), 'LEFT'),
+            ('ALIGN', (2,1), (2,3), 'LEFT'),
+
+            # FONT
+            ('FONTSIZE', (0,0), (-1,-1), 8),
+
+            # HEADER BACKGROUND
         ])
 
-        elements.append(t_resist)
-        # No-Load Test
+        # Add dielectric table after it is created
+        elements.append(t_dielec)
+        elements.append(Spacer(1, 0.2*inch))
 
-        elements.append(Paragraph("<u><b>No load Test</b></u>", styles['Heading3']))
-        no_load = [
-            ["Volts", "Amps", "Watts", "Pf", "Hz"],
-            [str(data_row.iloc[37] if len(data_row) > 37 else ""), 
-             str(data_row.iloc[42] if len(data_row) > 42 else ""),
-             str(data_row.iloc[44] if len(data_row) > 44 else ""),
-             str(data_row.iloc[45] if len(data_row) > 45 else ""),
-             str(data_row.iloc[46] if len(data_row) > 46 else "")]
+        vibration_data = [
+        [
+            Paragraph("<b>Vibration and Noise Level Test</b>", vibration_bold_small_style),
+            Paragraph("<b>RDSO E-10/3/09 - 19.7.7</b>", vibration_bold_small_style),
+            Paragraph("The vibration levels on the motors shall not exceed 15/10 microns refer clause 4.9 when tested as per IS : 4729-1968.", vibration_body_small_style),
+            Paragraph("<b>Vibration at Prescribed locations</b>", vibration_bold_small_style),
+            "", "", "",
+            Paragraph("<b>Maximum Permissible</b>", vibration_bold_small_style),
+            Paragraph("<b>Result</b>", vibration_bold_small_style)
+        ],
+        [
+            "", "", "",
+            Paragraph("<b>Displacement (Micro)</b>", vibration_bold_small_style),
+            "4", "4", "5",
+            "15",
+            "Accepted"
+        ],
+        [
+            "", "", "",
+            Paragraph("<b>Velocity in mm/sec</b>", vibration_bold_small_style),
+            "0.4", "0.4", "0.5",
+            "1.3",
+            "Accepted"
         ]
-        t_noload = Table(no_load, colWidths=[1.2*inch]*5)
-        t_noload.setStyle([('GRID', (0,0), (-1,-1), 0.5, colors.black)])
-        elements.append(t_noload)
-        elements.append(Spacer(1, 0.1*inch))
-        
-        # Locked Rotor Test
-        elements.append(Paragraph("<u><b>Locked Rotor Test</b></u>", styles['Heading3']))
-        locked = [
-            ["Volts", "Amps", "Watts", "N.m at 1 mtr", "% of Starting Torque"],
-            [str(data_row.iloc[56] if len(data_row) > 56 else ""),
-             str(data_row.iloc[61] if len(data_row) > 61 else ""),
-             str(data_row.iloc[63] if len(data_row) > 63 else ""),
-             str(data_row.iloc[66] if len(data_row) > 66 else ""),
-             str(data_row.iloc[67] if len(data_row) > 67 else ""),],
-            ["Rated Voltage =", "415", "", "", ""]
+    ]
+        # Target column widths for the vibration/noise/surge tables
+        vib_col_widths = [0.6*inch, 0.6*inch, 0.8*inch, 1.0*inch, 0.4*inch, 0.4*inch, 0.4*inch, 0.7*inch, 0.4*inch]
+        noise_col_widths = [0.92*inch, 0.92*inch]
+        surge_col_widths = [1.15*inch, 0.95*inch, 1.35*inch, 2.0*inch]
+        page_content_width = doc.pagesize[0] - doc.leftMargin - doc.rightMargin
+        desired_vib_width = sum(vib_col_widths)
+        vib_width = page_content_width
+        vib_scale = vib_width / desired_vib_width if desired_vib_width else 1.0
+        vib_col_widths = [w * vib_scale for w in vib_col_widths]
+
+        t_vibration = Table(
+            vibration_data,
+            colWidths=vib_col_widths,
+            rowHeights=[None]*len(vibration_data)
+
+        )
+        t_vibration.hAlign = 'LEFT'
+        t_vibration.setStyle([
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+
+            # LEFT SIDE MERGE
+            ('SPAN', (0,0), (0,2)),
+            ('SPAN', (1,0), (1,2)),
+            ('SPAN', (2,0), (2,2)),
+
+            # HEADER MERGE (Vibration title)
+            ('SPAN', (3,0), (6,0)),
+
+            # ALIGNMENT
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+
+            # LEFT ALIGN description
+            ('ALIGN', (2,0), (2,2), 'LEFT'),
+            ('ALIGN', (3,1), (3,2), 'LEFT'),
+
+            # FONT
+            ('FONTSIZE', (0,0), (-1,-1), 7),
+
+            # HEADER BG
+        ])
+
+        elements.append(t_vibration)
+        elements.append(Spacer(1, 0.2*inch))
+
+        noise_data = [
+            [
+                Paragraph("<b>Noise Level</b>", bottom_bold_small_style),
+                Paragraph("<b>Maximum Allowed</b>", bottom_bold_small_style),
+            ],
+            ["63.5 db", "90 db"],
+            ["Accepted"]
         ]
-        t_locked = Table(locked, colWidths=[1.4*inch]*5)
-        t_locked.setStyle([('GRID', (0,0), (-1,-1), 0.5, colors.black)])
-        elements.append(t_locked)
-        elements.append(Spacer(1, 0.05*inch))        # before building, attempt to append a second page with the
+
+        t_noise = Table(noise_data, colWidths=noise_col_widths, rowHeights=[0.22*inch] * len(noise_data))
+        t_noise.hAlign = 'LEFT'
+
+        t_noise.setStyle([
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('FONTSIZE', (0,0), (-1,-1), 6.5),
+            ('SPAN', (0,2), (1,2)),
+        ])
+
+        surge_data = [[
+            Paragraph("<b>Surge Test without<br/>rotor in position</b>", bottom_bold_small_style),
+            Paragraph("<b>RDSO E-10/3/09 -<br/>19.7.8</b>", bottom_bold_small_style),
+            Paragraph("Should be conducted<br/>without rotor in<br/>position at 5 kV Pk-Pk", bottom_body_small_style),
+            Paragraph("No intern turn short found -<br/><b>Accepted</b>", bottom_body_small_style),
+        ]]
+
+        t_surge = Table(
+            surge_data,
+            colWidths=surge_col_widths,
+            rowHeights=[0.42*inch]
+        )
+        t_surge.hAlign = 'LEFT'
+        t_surge.setStyle([
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('FONTSIZE', (0,0), (-1,-1), 6.5),
+            ('ALIGN', (3,0), (3,0), 'LEFT'),
+        ])
+
+        elements.append(t_noise)
+        elements.append(Spacer(1, 0.2*inch))
+        elements.append(t_surge)
+        # before building, attempt to append a second page with the
         # assembly-specific vibration table read from the same workbook.
         # ------------------------------------------------------------------
 
-        # attempt to read the sheet containing the small tables; the user
-        # indicates these are stored in the vibration workbook rather than our
-        # main data file.
-        try:
-            small_df = pd.read_excel(vibration_file, sheet_name=0, header=None)
-        except Exception as exc:
-            print("WARNING: could not open vibration file:", exc)
-            small_df = pd.DataFrame()
+        # Debug: try wrapping each flowable to identify which table fails due to width/height issues.
+        from reportlab.platypus import Table
 
+        max_width = doc.pagesize[0] - doc.leftMargin - doc.rightMargin
+        max_height = doc.pagesize[1] - doc.topMargin - doc.bottomMargin
 
+        def _debug_wrap(flowable, prefix=""):
+            try:
+                if isinstance(flowable, Table):
+                    summary = f"Table({len(getattr(flowable, '_cellvalues', []))} rows)"
+                    print(f"DEBUG: Wrapping {prefix}{summary}")
+                    # try to wrap this table with available page width
+                    flowable.wrap(max_width, max_height)
+                elif hasattr(flowable, 'wrap'):
+                    flowable.wrap(max_width, max_height)
+            except Exception as e:
+                print(f"DEBUG: Flowable failing wrap: {prefix}{type(flowable).__name__} -> {e}")
+                if isinstance(flowable, Table):
+                    try:
+                        # dump a preview of the table
+                        rows = getattr(flowable, '_cellvalues', [])
+                        print(f"DEBUG: Table first row: {rows[0] if rows else None}")
+                    except Exception:
+                        pass
+                raise
 
-        assembly_table = []
-        if not small_df.empty:
-            assembly_table = extract_table_for_assembly(small_df, assembly_no)
+            if isinstance(flowable, Table):
+                for row in getattr(flowable, '_cellvalues', []):
+                    for cell in row:
+                        _debug_wrap(cell, prefix + "  ")
+            elif hasattr(flowable, 'flowables'):
+                for f in getattr(flowable, 'flowables', []):
+                    _debug_wrap(f, prefix + "  ")
 
-            # if extraction failed, build a list of available assembly numbers
-            
-        assembly_table = []
-        if not small_df.empty:
-            assembly_table = extract_table_for_assembly(small_df, assembly_no)
+        print('DEBUG: elements types:', [type(e).__name__ for e in elements])
+       # for flow in elements:
+        #    _debug_wrap(flow)
 
-            # if extraction failed, build a list of available assembly numbers
-            if not assembly_table:
-                found = []
-                for _, r in small_df.iterrows():
-                    joined = " ".join(str(x) if not pd.isna(x) else "" for x in r.tolist())
-                    m = re.search(r"ASSEMBLY\s*NO[-\s]*(\d+)", joined, flags=re.I)
-                    if m:
-                        found.append(m.group(1))
-                found = sorted(set(found))
-                print("Available vibration assemblies in sheet:", found)
-                try:
-                    from tkinter import messagebox
-                    messagebox.showinfo("Vibration data",
-                                        f"No table for {assembly_no}.\n"
-                                        f"Available assemblies: {', '.join(found)}")
-                except Exception:
-                    pass
-
-
-        if assembly_table:
-            # drop any rows that are just headers or notes; these usually
-            # contain the words "ASSEMBLY NO" or "OVERALL" in the first
-            # column and are not part of the numeric data.
-            cleaned = []
-            for r in assembly_table:
-                # ignore completely empty rows
-                if not r or all(not str(c).strip() for c in r):
-                    continue
-                first = str(r[0]).strip().upper()
-                # drop header markers we don't want
-                if first.startswith('ASSEMBLY NO') or 'OVERALL' in first:
-                    continue
-                # keep frequency header row (it usually contains 'HZ')
-                if not re.match(r"^\d", first) and 'HZ' not in first:
-                    # any other non‑numeric row is noise
-                    continue
-                cleaned.append(r)
-            assembly_table = cleaned
-
-            # debug: report how many data rows we have
-            print(f"Vibration rows after cleaning: {len(assembly_table)}")
-
-            # prepended rows as requested by user (top-first order)
-            header_rows = [
-                ["TMB UNIT"],
-                [f"Sr no : {motor_sr_var.get() or ''}"],
-                ["Overall vibration measurement at non-driving end mm/s"]
-            ]
-            # drop any completely empty columns (they only add narrow gaps)
-            if assembly_table:
-                maxcols = max(len(r) for r in assembly_table)
-                keep = [False] * maxcols
-                for col in range(maxcols):
-                    for r in assembly_table:
-                        if col < len(r) and str(r[col]).strip():
-                            keep[col] = True
-                            break
-                # rebuild rows keeping only non-empty columns
-                new_rows = []
-                for r in assembly_table:
-                    new_rows.append([r[c] for c in range(len(r)) if keep[c]])
-                assembly_table = new_rows
-                cols = maxcols = max(len(r) for r in assembly_table) if assembly_table else 0
-            else:
-                cols = 1
-            # remove any stray CU UNIT rows from the extracted data so we
-            # don't end up with another copy at the bottom of the frequency
-            # column.  We'll prepend a single header row below.
-            assembly_table = [r for r in assembly_table if not (r and str(r[0]).strip().upper() == 'CU UNIT')]
-
-            # insert header rows in reverse order so the list order represents top-to-bottom
-            for hr in reversed(header_rows):
-                if len(hr) < cols:
-                    hr += [''] * (cols - len(hr))
-                elif len(hr) > cols:
-                    hr = hr[:cols]
-                assembly_table.insert(0, hr)
-
-            elements.append(PageBreak())
-            elements.append(Paragraph(
-                f"<u><b>Vibration Test </b></u>",
-                styles['Heading2']))
-            # build a table using column widths proportional to the
-            # maximum content in each column (so every column can have a
-            # different size).
-            if assembly_table:
-                maxcols = max(len(r) for r in assembly_table)
-            else:
-                maxcols = 0
-            # compute width for each column based on longest string
-            colwidths = []
-            for col in range(maxcols):
-                maxlen = 0
-                for r in assembly_table:
-                    if col < len(r):
-                        l = len(str(r[col]))
-                        if l > maxlen:
-                            maxlen = l
-                # fudge factor: 0.12 inch per character + 0.2 inch padding
-                width_in_inches = 0.12 * maxlen + 0.2
-                # convert to points and enforce minimum
-                width_pts = width_in_inches * inch
-                # cap frequency column to 1 inch (reduce breadth)
-                if col == 0:
-                    width_pts = min(width_pts, 1 * inch)
-                colwidths.append(max(width_pts, 0.5 * inch))
-
-            # if the table is too wide for the page, scale columns proportionally
-            available = doc.width  # already in points
-            total = sum(colwidths)
-            if total > available and total > 0:
-                factor = available / total
-                colwidths = [w * factor for w in colwidths]
-
-            # use a minimum row height to prevent vertical overlap
-            row_heights = [0.2 * inch] * len(assembly_table)
-            vib_table = Table(assembly_table, colWidths=colwidths, rowHeights=row_heights)
-            # span the header rows (first few rows we prepended) across all
-            # columns so their text doesn't wrap in a narrow first column.
-            header_count = len(header_rows)
-            style_list = [
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('FONTSIZE', (0, 0), (-1, -1), 8),
-            ]
-            for r in range(header_count):
-                style_list.append(('SPAN', (0, r), (-1, r)))
-            vib_table.setStyle(style_list)
-            elements.append(vib_table)
-        else:
-            # no table found; still add a page so the caller knows
-            elements.append(PageBreak())
-            elements.append(Paragraph(
-                f"<b>No vibration table found for assembly {assembly_no}</b>",
-                styles['Normal']))
-        
-        doc.build(elements, onFirstPage=draw_logo_and_stamp, onLaterPages=draw_logo_and_stamp)
+        # Build and save the PDF (no vibration test table included)
+        doc.build(elements, onFirstPage=draw_header, onLaterPages=draw_header)
         
         print(f"PDF saved to: {pdf_path}")
         
         # Try to open it automatically
         import subprocess
         try:
-            if os.name == 'nt':
-                os.startfile(pdf_path)
-            else:
-                subprocess.Popen(['xdg-open' if shutil.which('xdg-open') else 'open', pdf_path])
-            print("Opening PDF...")
+            if open_pdf:
+                if os.name == 'nt':
+                    os.startfile(pdf_path)
+                else:
+                    subprocess.Popen(['xdg-open' if shutil.which('xdg-open') else 'open', pdf_path])
+                print("Opening PDF...")
         except Exception:
             pass
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print("ERROR:", e)
 
 # ===== GUI SETUP =====
-# build a very simple form
 root = Tk()
-root.title("TELEMA B-35 - Routine Test Report Generator")
-root.state('zoomed') 
+root.title("Standard Radiator report generator")
+root.state('zoomed')
+
+report_sections = {}
+active_report_id = 1
 
 
-# Define the Tkinter variables
-motor_var = StringVar(master=root)
-date_var = StringVar(master=root)
-dimension_var = StringVar(master=root)
-motor_sr_var = StringVar(master=root)
-no_load_var = StringVar(master=root)
-locked_var = StringVar(master=root)
-#inspector_var = StringVar(master=root)
+def _merge_pdfs(pdf_paths, output_path):
+    merger = None
+    try:
+        try:
+            from pypdf import PdfWriter, PdfReader
+        except ImportError:
+            try:
+                from PyPDF2 import PdfWriter, PdfReader
+            except ImportError:
+                import subprocess
+                cmd = [
+                    "py", "-c",
+                    (
+                        "from pypdf import PdfWriter, PdfReader; "
+                        "import sys; "
+                        "writer = PdfWriter(); "
+                        "paths = sys.argv[1:-1]; "
+                        "out = sys.argv[-1]; "
+                        "[writer.add_page(page) for p in paths for page in PdfReader(p).pages]; "
+                        "writer.write(out)"
+                    ),
+                    *pdf_paths,
+                    output_path,
+                ]
+                subprocess.check_call(cmd)
+                return
 
-# Resistance test variables (manual entry)
-res_cold_var = StringVar(master=root)
-res_20deg_var = StringVar(master=root)
+        merger = PdfWriter()
+        for pdf_path in pdf_paths:
+            reader = PdfReader(pdf_path)
+            for page in reader.pages:
+                merger.add_page(page)
+        with open(output_path, "wb") as f:
+            merger.write(f)
+    finally:
+        if merger and hasattr(merger, "close"):
+            merger.close()
 
-# Dimension variables
-shaft_dia_var = StringVar(master=root)
-a_dist_var = StringVar(master=root)
-b_dist_var = StringVar(master=root)
-mount_hole_var = StringVar(master=root)
-total_length_var = StringVar(master=root)
-pcd_var = StringVar(master=root)
-flange_var = StringVar(master=root)
 
-## GUI Layout - improved grid to avoid overlapping
-root.columnconfigure(0, weight=1, minsize=80)
-root.columnconfigure(1, weight=2, minsize=160)
-root.columnconfigure(2, weight=1, minsize=80)
-root.columnconfigure(3, weight=2, minsize=160)
+def _activate_report(report_id):
+    global active_report_id
+    global motor_var, date_var, motor_sr_var, no_load_var, locked_var
+    global res_cold_var, res_20deg_var, resistance_mode_var, connection_type_var
+    global assembly_combo, rb_star, rb_delta
 
-# Motor Model
-Label(root, text="Motor Model No").grid(row=0, column=0, sticky="w", padx=4, pady=2)
-Entry(root, textvariable=motor_var, width=25).grid(row=0, column=1, sticky="ew", padx=4, pady=2)
+    cfg = report_sections[report_id]
+    active_report_id = report_id
+    motor_var = cfg["motor_var"]
+    date_var = cfg["date_var"]
+    motor_sr_var = cfg["motor_sr_var"]
+    no_load_var = cfg["no_load_var"]
+    locked_var = cfg["locked_var"]
+    res_cold_var = cfg["res_cold_var"]
+    res_20deg_var = cfg["res_20deg_var"]
+    resistance_mode_var = cfg["resistance_mode_var"]
+    connection_type_var = cfg["connection_type_var"]
+    assembly_combo = cfg["assembly_combo"]
+    rb_star = cfg["rb_star"]
+    rb_delta = cfg["rb_delta"]
 
-Button(root, text="Fetch Assemblies", command=load_assembly_numbers).grid(row=0, column=2, padx=4, pady=2)
 
-# Motor Serial No
-Label(root, text="Motor Sr No").grid(row=1, column=0, sticky="w", padx=4, pady=2)
-Entry(root, textvariable=motor_sr_var, width=25).grid(row=1, column=1, sticky="ew", padx=4, pady=2)
+def _run_for_report(report_id, func, *args, **kwargs):
+    previous = active_report_id
+    try:
+        _activate_report(report_id)
+        _update_connection_controls()
+        return func(*args, **kwargs)
+    finally:
+        _activate_report(previous)
+        _update_connection_controls()
 
-# Date
-Label(root, text="Date").grid(row=2, column=0, sticky="w", padx=4, pady=2)
-Entry(root, textvariable=date_var, width=20).grid(row=2, column=1, sticky="ew", padx=4, pady=2)
 
-# Assembly dropdown
-Label(root, text="Assembly No").grid(row=2, column=2, sticky="w", padx=4, pady=2)
-assembly_combo = ttk.Combobox(root, width=20, state="readonly")
-assembly_combo.grid(row=2, column=3, sticky="ew", padx=4, pady=2)
+def _update_connection_controls(*args):
+    for cfg in report_sections.values():
+        state = 'normal' if cfg["resistance_mode_var"].get() == 'Line' else 'disabled'
+        cfg["rb_star"].config(state=state)
+        cfg["rb_delta"].config(state=state)
 
-# Dimensions section
-Label(root, text="--- DIMENSIONS (Manual Entry) ---",
-      font=("Arial", 10, "bold")).grid(row=3, column=0, columnspan=4, sticky="w", pady=5, padx=4)
 
-Label(root, text="Shaft Diameter").grid(row=4, column=0, sticky="w")
-Entry(root, textvariable=shaft_dia_var, width=20).grid(row=4, column=1)
+def _generate_combined_pdf():
+    import tempfile
+    import subprocess
 
-Label(root, text="A - Distance").grid(row=4, column=2, sticky="w")
-Entry(root, textvariable=a_dist_var, width=20).grid(row=4, column=3)
+    required = []
+    for report_id, cfg in report_sections.items():
+        model = cfg["motor_var"].get().strip()
+        assembly = cfg["assembly_combo"].get().strip()
+        if not model or not assembly:
+            required.append(str(report_id))
 
-Label(root, text="B - Distance").grid(row=5, column=0, sticky="w")
-Entry(root, textvariable=b_dist_var, width=20).grid(row=5, column=1)
+    if required:
+        print("Please complete Motor Model and Assembly Number for report(s):", ", ".join(required))
+        return
 
-Label(root, text="Diameter at foot").grid(row=5, column=2, sticky="w")
-Entry(root, textvariable=mount_hole_var, width=20).grid(row=5, column=3)
+    desktop = os.path.expanduser("~\\Desktop")
+    os.makedirs(desktop, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix="telema_reports_")
+    pdf_1 = os.path.join(temp_dir, "report_1.pdf")
+    pdf_2 = os.path.join(temp_dir, "report_2.pdf")
+    final_pdf = os.path.join(desktop, "certificate_combined.pdf")
 
-Label(root, text="Total Length").grid(row=6, column=0, sticky="w")
-Entry(root, textvariable=total_length_var, width=20).grid(row=6, column=1)
+    _run_for_report(1, generate_pdf, pdf_1, False)
+    _run_for_report(2, generate_pdf, pdf_2, False)
+    _merge_pdfs([pdf_1, pdf_2], final_pdf)
+    print(f"Combined PDF saved to: {final_pdf}")
 
-Label(root, text="PCD").grid(row=6, column=2, sticky="w")
-Entry(root, textvariable=pcd_var, width=20).grid(row=6, column=3)
+    try:
+        if os.name == 'nt':
+            os.startfile(final_pdf)
+        else:
+            subprocess.Popen(['xdg-open' if shutil.which('xdg-open') else 'open', final_pdf])
+    except Exception:
+        pass
 
-Label(root, text="Diameter at flange").grid(row=7, column=2, sticky="w")
-Entry(root, textvariable=flange_var, width=20).grid(row=7, column=3)
 
-#Label(root, text="Inspector").grid(row=7, column=0, sticky="w")
-#Entry(root, textvariable=inspector_var, width=20).grid(row=7, column=1)
+def _build_report_section(parent, title, report_id):
+    frame = LabelFrame(parent, text=title, padx=8, pady=8)
+    frame.grid_columnconfigure(1, weight=1, minsize=220)
+    frame.grid_columnconfigure(3, weight=1, minsize=220)
 
-# Resistance test section
-Label(root, text="--- RESISTANCE TEST (Manual Entry) ---",
-      font=("Arial", 10, "bold")).grid(row=8, column=0, columnspan=4, sticky="w", pady=5)
+    cfg = {
+        "motor_var": StringVar(master=root),
+        "date_var": StringVar(master=root),
+        "motor_sr_var": StringVar(master=root),
+        "no_load_var": StringVar(master=root),
+        "locked_var": StringVar(master=root),
+        "res_cold_var": StringVar(master=root),
+        "res_20deg_var": StringVar(master=root),
+        "resistance_mode_var": StringVar(master=root, value="Line"),
+        "connection_type_var": StringVar(master=root, value="Star"),
+    }
 
-Label(root, text="Resistance at Ambient Temp").grid(row=9, column=0, sticky="w")
-Entry(root, textvariable=res_cold_var, width=20, state="readonly").grid(row=9, column=1)
+    Label(frame, text="Motor Model No").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+    Entry(frame, textvariable=cfg["motor_var"], width=25).grid(row=0, column=1, sticky="ew", padx=4, pady=2)
+    Button(frame, text="Fetch Assemblies", command=lambda rid=report_id: _run_for_report(rid, load_assembly_numbers)).grid(row=0, column=2, padx=4, pady=2)
 
-Label(root, text="Resistance at -20 Deg C").grid(row=9, column=2, sticky="w")
-Entry(root, textvariable=res_20deg_var, width=20, state="readonly").grid(row=9, column=3)
+    Label(frame, text="Motor Sr No").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+    Entry(frame, textvariable=cfg["motor_sr_var"], width=25).grid(row=1, column=1, sticky="ew", padx=4, pady=2)
 
-# Buttons
-Button(root, text="Load Data", command=load_data).grid(row=10, column=0, pady=8)
-Button(root, text="Generate PDF", command=generate_pdf).grid(row=10, column=1, pady=8)
-# start the Tk event loop when the script is executed directly
+    Label(frame, text="Date").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+    Entry(frame, textvariable=cfg["date_var"], width=20).grid(row=2, column=1, sticky="ew", padx=4, pady=2)
+
+    Label(frame, text="Assembly No").grid(row=2, column=2, sticky="w", padx=4, pady=2)
+    cfg["assembly_combo"] = ttk.Combobox(frame, width=22, state="readonly")
+    cfg["assembly_combo"].grid(row=2, column=3, sticky="ew", padx=4, pady=2)
+
+    Label(frame, text="--- RESISTANCE TEST (Manual Entry) ---", font=("Arial", 10, "bold")).grid(
+        row=3, column=0, columnspan=4, sticky="w", pady=6
+    )
+
+    Label(frame, text="Resistance at Ambient Temp").grid(row=4, column=0, sticky="w", padx=4, pady=2)
+    Entry(frame, textvariable=cfg["res_cold_var"], width=20, state="readonly").grid(row=4, column=1, sticky="w", padx=4, pady=2)
+
+    Label(frame, text="Resistance at -20 Deg C").grid(row=4, column=2, sticky="w", padx=4, pady=2)
+    Entry(frame, textvariable=cfg["res_20deg_var"], width=20, state="readonly").grid(row=4, column=3, sticky="w", padx=4, pady=2)
+
+    Label(frame, text="Resistance Type").grid(row=5, column=0, sticky="w", padx=4, pady=2)
+    Radiobutton(frame, text="Line", variable=cfg["resistance_mode_var"], value="Line").grid(row=5, column=1, sticky="w", padx=4, pady=2)
+    Radiobutton(frame, text="Phase", variable=cfg["resistance_mode_var"], value="Phase").grid(row=5, column=2, sticky="w", padx=4, pady=2)
+
+    Label(frame, text="Connection").grid(row=6, column=0, sticky="w", padx=4, pady=2)
+    cfg["rb_star"] = Radiobutton(frame, text="Star", variable=cfg["connection_type_var"], value="Star")
+    cfg["rb_star"].grid(row=6, column=1, sticky="w", padx=4, pady=2)
+    cfg["rb_delta"] = Radiobutton(frame, text="Delta", variable=cfg["connection_type_var"], value="Delta")
+    cfg["rb_delta"].grid(row=6, column=2, sticky="w", padx=4, pady=2)
+
+    cfg["resistance_mode_var"].trace_add('write', _update_connection_controls)
+
+    Button(frame, text="Load Data", command=lambda rid=report_id: _run_for_report(rid, load_data)).grid(row=7, column=0, padx=4, pady=8)
+
+    return frame, cfg
+
+
+root.grid_columnconfigure(0, weight=1)
+
+section_1, report_sections[1] = _build_report_section(root, "Report 1", 1)
+section_1.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+
+section_2, report_sections[2] = _build_report_section(root, "Report 2", 2)
+section_2.grid(row=1, column=0, sticky="ew", padx=10, pady=6)
+
+footer = Frame(root)
+footer.grid(row=2, column=0, sticky="w", padx=10, pady=10)
+Button(footer, text="Generate PDF", command=_generate_combined_pdf).grid(row=0, column=0, padx=4)
+
+_activate_report(1)
+_update_connection_controls()
+
 if __name__ == "__main__":
-    root.mainloop()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        root.destroy()
+        sys.exit(0)
